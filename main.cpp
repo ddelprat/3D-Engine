@@ -5,7 +5,9 @@
 #include "stb_image_write.h"
 
 #define STB_IMAGE_IMPLEMENTATION
+#include <fstream>
 #include <iostream>
+#include <list>
 
 #include "stb_image.h"
 
@@ -79,6 +81,16 @@ Vector cross(const Vector& a, const Vector& b) {
 	return Vector(a[1]*b[2]- a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]);
 }
 
+int getMaxDimension(Vector v) {
+	if (v[0] > v[1] && v[0] > v[2]) {
+		return 0;
+	}
+	if (v[1] > v[2] && v[1] > v[0]) {
+		return 1;
+	}
+	return 2;
+}
+
 class Ray {
 public:
 	explicit Ray(const Vector& origin, const Vector& direction) : O(origin), u(direction) {};
@@ -115,8 +127,8 @@ class BoundingBox {
 		// Checks if a ray intersect with the bounding box
 		bool intersect(const Ray& r) {
 			double tmin[3],tmax[3];
-			Vector Om = r.O - m;
-			Vector OM = r.O - M;
+			Vector Om = m - r.O;
+			Vector OM = M - r.O;
 			for (int i = 0; i < 3; i++) {
 				double t1 = Om[i]/r.u[i];
 				double t2 = OM[i]/r.u[i];
@@ -132,57 +144,126 @@ class BoundingBox {
 	Vector M;
 };
 
+class BVH {
+	public:
+		BVH() {}
+		BVH(BoundingBox& bbox): bbox(bbox) {}
+
+	BVH *left, *right;
+	BoundingBox bbox;
+	int start, end;
+
+};
+
 
 class TriangleMesh : public Geometry {
 public:
   ~TriangleMesh() {}
     explicit TriangleMesh(const Vector& Albedo, const bool Mirror = false, const bool isTransparent = false): Geometry(Albedo, Mirror, isTransparent) {};
 
+	// Compute the bounding box for a given set of vertices
+	BoundingBox compute_bbox(int start, int end) {
+		Vector m,M;
+		for (int j=0;j<3;j++) {
+			double min = vertices[indices[start].vtxi][j],max = vertices[indices[start].vtxi][j];
+			for (int i=start; i<end; i++) {
+				if (vertices[indices[i].vtxi][j] < min) min = vertices[indices[i].vtxi][j];
+				if (vertices[indices[i].vtxi][j] > max) max = vertices[indices[i].vtxi][j];
+
+				if (vertices[indices[i].vtxj][j] < min) min = vertices[indices[i].vtxj][j];
+				if (vertices[indices[i].vtxj][j] > max) max = vertices[indices[i].vtxj][j];
+
+				if (vertices[indices[i].vtxk][j] < min) min = vertices[indices[i].vtxk][j];
+				if (vertices[indices[i].vtxk][j] > max) max = vertices[indices[i].vtxk][j];
+			}
+			m[j] = min; M[j] = max;
+		}
+		return BoundingBox(m,M);
+	}
+
+	// Build mesh BVH
+	void build_bvh(BVH* bvh, int start, int end) {
+		bvh->start = start;
+		bvh->end = end;
+		bvh->left = NULL;
+		bvh->right = NULL;
+		bvh->bbox = compute_bbox(start, end);
+		if (end - start <= 4) return;
+
+		Vector mM = bvh->bbox.M - bvh->bbox.m;
+		int maxDim = getMaxDimension(mM);
+		int pivot = start;
+		double middle = mM[maxDim]/2 + bvh->bbox.m[maxDim];
+
+		for (int i = start; i < end; i++) {
+			double barycent = (vertices[indices[i].vtxi][maxDim] + vertices[indices[i].vtxj][maxDim] + vertices[indices[i].vtxk][maxDim])/3;
+			if (barycent <= middle) { // if triangles are on the left part
+				std::swap(indices[i], indices[pivot]);
+				pivot++;
+			}
+		}
+		if (pivot == start || pivot == end) return;
+
+		bvh->left = new BVH();
+		bvh->right = new BVH();
+		build_bvh(bvh->left, start, pivot);
+		build_bvh(bvh->right, pivot, end);
+	}
+
 	// Computes intersection with the triangles if the mesh
 	double intersect(const Ray& r, Vector& P, Vector& bestN) const override {
-		// // TODO : regarder pourquoi je peux pas appliquer la méthode directement
-		// BoundingBox bbox2 = bbox;
-		// if (bbox2.intersect(r)){
-		// 	return -1;
-		// }
-
 		bool has_intersection = false;
 		double min_dist = std::numeric_limits<double>::max();
 
-	    for (int i = 0; i < indices.size(); i++) {
-	    	const Vector A = vertices[indices[i].vtxi];
-	        const Vector B = vertices[indices[i].vtxj];
-	        const Vector C = vertices[indices[i].vtxk];
-	        const Vector e1 = B - A;
-	        const Vector e2 = C - A;
-	        Vector AO = r.O - A;
-	        Vector AOcrossU = cross(AO, r.u);
-	        Vector N = cross(e1, e2);
+		std::vector<BVH*> bvhs;
+		bvhs.push_back(meshBVH);
 
-	        double invDet = 1./dot(r.u, N);
+		while (!bvhs.empty()) {
+			const BVH* cur = bvhs.back();
+			bvhs.pop_back();
+			if (cur->left) {
+				if (cur->left->bbox.intersect(r)) {
+					bvhs.push_back(cur->left);
+				}
+				if (cur->right->bbox.intersect(r)) {
+					bvhs.push_back(cur->right);
+				}
+			} else {
+				for (int i = cur->start; i < cur->end; i++) {
+					const Vector A = vertices[indices[i].vtxi];
+					const Vector B = vertices[indices[i].vtxj];
+					const Vector C = vertices[indices[i].vtxk];
+					const Vector e1 = B - A;
+					const Vector e2 = C - A;
+					Vector AO = r.O - A;
+					Vector AOcrossU = cross(AO, r.u);
+					Vector N = cross(e1, e2);
 
-	        double beta = -dot(e2,AOcrossU) * invDet;
-	        if (beta<0) continue;
-	        if (beta>1) continue;
+					double invDet = 1./dot(r.u, N);
 
-	        double gamma = dot(e1,AOcrossU) * invDet;
-	        if (gamma<0) continue;
-	        if (gamma>1) continue;
+					double beta = -dot(e2,AOcrossU) * invDet;
+					if (beta<0) continue;
+					if (beta>1) continue;
 
-	        double alpha = 1 - beta - gamma;
-	        if (alpha<0) continue;
+					double gamma = dot(e1,AOcrossU) * invDet;
+					if (gamma<0) continue;
+					if (gamma>1) continue;
 
-	        double t = -dot(AO, N) * invDet;
-	        if (t < 0) continue;
-	        if (t > min_dist) continue;
+					double alpha = 1 - beta - gamma;
+					if (alpha<0) continue;
 
-	        min_dist = t;
-	        P = r.O + t * r.u;
-	        N.normalize();
-	        bestN = N;
-	        has_intersection = true;
-	      }
+					double t = -dot(AO, N) * invDet;
+					if (t < 0) continue;
+					if (t > min_dist) continue;
 
+					min_dist = t;
+					P = r.O + t * r.u;
+					N.normalize();
+					bestN = normals[indices[i].ni] * alpha + normals[indices[i].nj] * beta + normals[indices[i].nk] * gamma;
+					has_intersection = true;
+				}
+			}
+		}
 		return has_intersection ? min_dist : -1;
 	};
 
@@ -387,6 +468,7 @@ public:
     std::vector<Vector> uvs;
     std::vector<Vector> vertexcolors;
 	BoundingBox bbox;
+	BVH *meshBVH;
 
 };
 
@@ -600,7 +682,8 @@ int main() {
 	TriangleMesh *catMesh = new TriangleMesh(Vector(0.5,0.5,0.5), false, false);
 	catMesh->readOBJ("Mesh/Models_F0202A090/cat.obj");
 	catMesh->scale(0.75, Vector(0,-10,0));
-	catMesh->compute_bbox();
+	catMesh->meshBVH = new BVH();
+	catMesh->build_bvh(catMesh->meshBVH,0, catMesh->indices.size());
 	scene.addMesh(catMesh);
 
 	Vector O(0,10,-55);
