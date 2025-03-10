@@ -102,7 +102,7 @@ public:
 class Geometry {
   public:
     Geometry(const Vector& Albedo, const bool Mirror = false, const bool isTransparent = false) : Albedo(Albedo), Mirror(Mirror), isTransparent(isTransparent) {};
-	virtual double intersect(const Ray& r, Vector& P, Vector& N) const = 0;
+	virtual double intersect(const Ray& r, Vector& P, Vector& N, Vector& color) const = 0;
 
 	Vector Albedo;
 	bool Mirror;
@@ -211,7 +211,7 @@ public:
 	}
 
 	// Computes intersection with the triangles if the mesh
-	double intersect(const Ray& r, Vector& P, Vector& bestN) const override {
+	double intersect(const Ray& r, Vector& P, Vector& bestN, Vector& color) const override {
 		bool has_intersection = false;
 		double min_dist = std::numeric_limits<double>::max();
 
@@ -261,11 +261,38 @@ public:
 					N.normalize();
 					bestN = normals[indices[i].ni] * alpha + normals[indices[i].nj] * beta + normals[indices[i].nk] * gamma;
 					has_intersection = true;
+
+					// apply textures
+					if (textures.size() > 0) {
+						Vector uv = alpha * uvs[indices[i].uvi] +  beta * uvs[indices[i].uvj] +  gamma * uvs[indices[i].uvk];
+						int w = texW[indices[i].group];
+						int h = texH[indices[i].group];
+
+						uv[0] = fmod(uv[0] + 10000, 1.);
+						uv[1] = fmod(uv[1] + 10000, 1.);
+						int uvx = w * uv[0];
+						int uvy = h * (1- uv[1]);
+						color = Vector(textures[indices[i].group][(uvy * w + uvx)*3 + 0],
+							textures[indices[i].group][(uvy * w + uvx)*3 + 1],
+							textures[indices[i].group][(uvy * w + uvx)*3 + 2]);
+					}
 				}
 			}
 		}
 		return has_intersection ? min_dist : -1;
 	};
+
+	void add_texture(const char* filename) {
+		int w, h, c;
+		unsigned char  * tex = stbi_load(filename, &w, &h, &c, 3 );
+		texW.push_back(w);
+		texH.push_back(h);
+		std::vector<double > texture(w*h*3);
+		for (int i = 0; i < w*h*3; i++) {
+			texture[i] = std::pow(tex[i]/255., 2.2);
+		}
+		textures.push_back(texture);
+	}
 
 	void scale(double a, const Vector & b) {
 		for (int i=0; i<vertices.size();i++) {
@@ -467,6 +494,8 @@ public:
     std::vector<Vector> normals;
     std::vector<Vector> uvs;
     std::vector<Vector> vertexcolors;
+	std::vector<std::vector<double> > textures;
+	std::vector<int> texW, texH;
 	BoundingBox bbox;
 	BVH *meshBVH;
 
@@ -475,10 +504,10 @@ public:
 class Sphere : public Geometry {
 public:
 	explicit Sphere(const Vector& C, const double R, const Vector& Albedo, const bool Mirror = false, const bool isTransparent = false, const float refraction_index = 1) :
-	Geometry(Albedo, Mirror, isTransparent), C(C), R(R), refraction_index(refraction_index) {};
+	Geometry(Albedo, Mirror, isTransparent), C(C), R(R), refraction_index(refraction_index), albedo(Albedo) {};
 
 	// Determines if a ray is intersected by an object and determine the position of the intersection
-	double intersect(const Ray& r, Vector& P, Vector& N) const override {
+	double intersect(const Ray& r, Vector& P, Vector& N, Vector& color) const override {
 		// solve ax^2 + bx + c = 0
 		double b = 2 * dot(r.u, r.O - C);
 		double c = (r.O-C).norm2() - R * R;
@@ -500,12 +529,14 @@ public:
 		P = r.O + t * r.u;
 		N = P - C;
 		N.normalize();
+		color = albedo;
 		return t;
 	}
 
 	Vector C;
 	double R;
 	double refraction_index;
+	Vector albedo;
 };
 
 class Scene {
@@ -515,16 +546,16 @@ public:
 	void addMesh(const TriangleMesh *s) { objects.push_back(s);}
 
 	// Determines the first object that intersect the ray
-	double first_intersect(const Ray& r, Vector& P, Vector& N, Vector& Albedo, bool& Mirror, bool& isTransparent, int& index, double& R) {
+	double first_intersect(const Ray& r, Vector& P, Vector& N, Vector& Albedo, bool& Mirror, bool& isTransparent, int& index) {
 		bool hasIntersection = false;
-		Vector local_P, local_N;
+		Vector local_P, local_N, object_color;
 		double min_dist = std::numeric_limits<double>::max();
 		for (int i = 0; i < (int)(objects.size()); i++) {
-			double dist = objects[i]->intersect(r, local_P, local_N);
+			double dist = objects[i]->intersect(r, local_P, local_N, object_color);
 			if (dist != -1 && dist < min_dist) {
 				hasIntersection = true;
 				min_dist = dist;
-				Albedo = objects[i]->Albedo;
+				Albedo = object_color;
                 Mirror = objects[i]->Mirror;
 				index = i;
                 isTransparent = objects[i]->isTransparent;
@@ -571,7 +602,7 @@ public:
 		if (nb_rebound <= 0) {
 			return Vector(0, 0, 0);
 		}
-		double min_dist = first_intersect(r, P, N, Albedo, Mirror, isTransparent, index, R);
+		double min_dist = first_intersect(r, P, N, Albedo, Mirror, isTransparent, index);
 		if (min_dist != -1) {
 			if (isIndirect && index == 0) {
 				return Vector(0,0, 0);
@@ -634,7 +665,7 @@ public:
 			Ray shadowRay(P+0.0001*N,Px);
 			Vector directLight, shadowColor, shadowN, shadowP;
 			// If it is NOT a shadow, directlight is not 0
-			if (first_intersect(shadowRay, shadowP, shadowN, shadowColor, Mirror, isTransparent, index, R) > sqrt(Px_norm2) - 0.1) {
+			if (first_intersect(shadowRay, shadowP, shadowN, shadowColor, Mirror, isTransparent, index) > sqrt(Px_norm2) - 0.1) {
 				double px = std::max(1e-12, dot(-PL, Nprime))/(M_PI * dynamic_cast<const Sphere*>(objects[0])->R * dynamic_cast<const Sphere*>(objects[0])->R);
 				directLight = (I * std::max(0., dot(N, Px)) * std::max(0., dot(-Px, Nprime)) * Albedo) / (Px_norm2 * M_PI * px * sqr(2 * M_PI * dynamic_cast<const Sphere*>(objects[0])->R));
 			}
@@ -657,10 +688,10 @@ public:
 
 
 int main() {
-	int W = 128;
-	int H = 128;
-	int num_simu = 2;
-	int num_rebonds = 3;
+	int W = 512;
+	int H = 512;
+	int num_simu = 20;
+	int num_rebonds = 5;
 	double alpha = 60 * 3.14159265358979323846 / 180;
 	double focusd = 65;
 
@@ -681,6 +712,7 @@ int main() {
 
 	TriangleMesh *catMesh = new TriangleMesh(Vector(0.5,0.5,0.5), false, false);
 	catMesh->readOBJ("Mesh/Models_F0202A090/cat.obj");
+	catMesh->add_texture("Mesh/Models_F0202A090/cat_diff.png");
 	catMesh->scale(0.75, Vector(0,-10,0));
 	catMesh->meshBVH = new BVH();
 	catMesh->build_bvh(catMesh->meshBVH,0, catMesh->indices.size());
