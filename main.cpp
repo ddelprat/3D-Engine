@@ -7,12 +7,15 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <fstream>
 #include <iostream>
+#include <chrono>
+#include <omp.h>
+
 #include <list>
 
 #include "stb_image.h"
 
 #include <random>
-static std::default_random_engine engine(10); // random seed=10
+static std::default_random_engine engine[10]; // random seed=10
 static std::uniform_real_distribution<double>uniform(0,1);
 
 static inline double sqr(double x) { return x * x; }
@@ -571,13 +574,14 @@ public:
 
 	// Computes direction vector of a randomly reflected ray on a surface
     Vector random_cos(Vector& N) {
-      double u1 = uniform(engine);
-      double u2 = uniform(engine);
-      double s = sqrt(1 - u2);
-      double x = cos(2. * M_PI * u1) * s;
-      double y = sin(2. * M_PI * u1) * s;
-      double z = sqrt(u2);
-      Vector T;
+		int thread_id = omp_get_thread_num();
+		double u1 = uniform(engine[thread_id]);
+		double u2 = uniform(engine[thread_id]);
+		double s = sqrt(1 - u2);
+		double x = cos(2. * M_PI * u1) * s;
+		double y = sin(2. * M_PI * u1) * s;
+		double z = sqrt(u2);
+		Vector T;
 		if(std::abs(N[0]) <= std::abs(N[1]) && std::abs(N[0]) <= std::abs(N[2])) {
 			T = Vector(0,N[2],-N[1]);
 		}
@@ -609,7 +613,7 @@ public:
 			}
 			if (index == 0) {
 				// TODO: add a sphere attribute light = true/false
-				return Vector(I, I, I)/ sqr(2*M_PI * R);
+				return Vector(I, I, I)/ sqr(2*M_PI * dynamic_cast<const Sphere*>(objects[0])->R);
 			}
 			if (Mirror) {
                 Vector R = r.u - 2 * dot(r.u, N)*N;
@@ -618,8 +622,7 @@ public:
 			}
 			if (isTransparent) {
 				double n1 = 1.;
-				// TODO : affect refraction index to the sphere
-				double n2 = 1.2;
+				double n2 = dynamic_cast<const Sphere*>(objects[index])->refraction_index;
 				Vector Ntransp = N;
 				if (dot(r.u, N) > 0) {
 					std::swap(n1,n2);
@@ -634,7 +637,7 @@ public:
 					return Vector(0, 0, 0);
 				}
 
-				double u = uniform(engine);
+				double u = uniform(engine[0]);
 				Vector color;
 				if (u<alphaT) {
 					// Refraction
@@ -656,7 +659,7 @@ public:
 			PL.normalize();
 
 			Vector PLinv = -PL;
-			Vector Nprime = random_cos(PLinv); // ==shadowN ?
+			Vector Nprime = random_cos(PLinv);
 			Vector x = Nprime * dynamic_cast<const Sphere*>(objects[0])->R + dynamic_cast<const Sphere*>(objects[0])->C;
 			Vector Px = x - P;
 			double Px_norm2 = Px.norm2();
@@ -688,12 +691,15 @@ public:
 
 
 int main() {
+	auto start = std::chrono::high_resolution_clock::now();
+
 	int W = 512;
 	int H = 512;
-	int num_simu = 20;
+	int num_simu = 128;
 	int num_rebonds = 5;
 	double alpha = 60 * 3.14159265358979323846 / 180;
 	double focusd = 65;
+	double opening = 0.3;
 
 	Scene scene;
 	scene.L = Vector(20,30,-30);
@@ -705,14 +711,14 @@ int main() {
 	scene.addSphere(new Sphere(Vector(0,0,-1100), 1000, Vector(0.7,0.5,0.5)));
 	scene.addSphere(new Sphere(Vector(1050,0,0), 1000, Vector(0.5,0.5,0.7)));
 	scene.addSphere(new Sphere(Vector(-1050,0,0), 1000, Vector(0.5,0.5,0.7)));
-	// scene.addSphere(new Sphere(Vector(-25,0,10),10, Vector(0.5,0.5,0.5), false, false, 1.5));
-	// scene.addSphere(new Sphere(Vector(0,0,10),10, Vector(0.5,0.5,0.5), true, false, 1.5));
-	// scene.addSphere(new Sphere(Vector(25,0,10),10, Vector(0.5,0.5,0.5), false, true, 1.5));
+	// scene.addSphere(new Sphere(Vector(-25,0,10),10, Vector(0.5,0.5,0.5), false, false));
+	// scene.addSphere(new Sphere(Vector(0,0,10),10, Vector(0.5,0.5,0.5), true, false));
+	// scene.addSphere(new Sphere(Vector(25,0,10),10, Vector(0.5,0.5,0.5), false, true, 1.));
 	// scene.addSphere(Sphere(Vector(0,-5,-20),5, Vector(0.5,0.0,0.0), false, false, 1.5));
 
 	TriangleMesh *catMesh = new TriangleMesh(Vector(0.5,0.5,0.5), false, false);
-	catMesh->readOBJ("Mesh/Models_F0202A090/cat.obj");
-	catMesh->add_texture("Mesh/Models_F0202A090/cat_diff.png");
+	catMesh->readOBJ("../Mesh/Models_F0202A090/cat.obj");
+	catMesh->add_texture("../Mesh/Models_F0202A090/cat_diff.png");
 	catMesh->scale(0.75, Vector(0,-10,0));
 	catMesh->meshBVH = new BVH();
 	catMesh->build_bvh(catMesh->meshBVH,0, catMesh->indices.size());
@@ -721,15 +727,17 @@ int main() {
 	Vector O(0,10,-55);
 
 	std::vector<unsigned char> image(W*H * 3, 0);
-#pragma omp parallel for
+	for (int i=0;i<8;i++) engine[i].seed(i);
+#pragma omp parallel for schedule(dynamic,1)
 	for (int i = 0; i < H; i++) {
 		for (int j = 0; j < W; j++) {
 			Vector color(0,0,0);
 			for (int k = 1; k < num_simu; k++) {
 
 				// anti-aliasing
-				double u1 = uniform(engine);
-				double u2 = uniform(engine);
+				int thread_id = omp_get_thread_num();
+				double u1 = uniform(engine[thread_id]);
+				double u2 = uniform(engine[thread_id]);
 				double rr = sqrt(-2 * log(u1));
 				double n1 = rr * cos(2.0 * M_PI * u2) * 0.5 ;
 				double n2 = rr * sin(2.0 * M_PI * u2) * 0.5;
@@ -738,8 +746,11 @@ int main() {
 				u.normalize();
 
 				// Depth of field
-				double n1b = rr * cos(2.0 * M_PI * u2) * 0.5 ;
-				double n2b = rr * sin(2.0 * M_PI * u2) * 0.5;
+				double u1_2 = uniform(engine[thread_id]);
+				double u2_2 = uniform(engine[thread_id]);
+				double rr_2 = sqrt(-2 * log(u1));
+				double n1b = rr_2 * cos(2.0 * M_PI * u1_2) * opening;
+				double n2b = rr_2 * sin(2.0 * M_PI * u2_2) * opening;
 
 				Vector dest = O + focusd * u;
 				Vector Oprime = O + Vector(n1b, n2b, 0);
@@ -759,7 +770,11 @@ int main() {
 			image[(i*W + j) * 3 + 2] = std::min(std::pow(color[2],1/2.2),255.);  // BLUE
 		}
 	}
-	stbi_write_png("image.png", W, H, 3, &image[0], 0);
+	stbi_write_png("../image.png", W, H, 3, &image[0], 0);
 
+	auto stop = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+
+	std::cout << "Execution time : " << duration.count()/1000 << " s" << std::endl;
 	return 0;
 }
